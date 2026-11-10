@@ -735,6 +735,132 @@ class WebSocketNativeCoroutineTest(WebSocketBaseTestCase):
         self.assertEqual(res, "hello2")
 
 
+class SendAndCloseHandler(TestWebSocketHandler):
+    """Sends a fixed burst of messages on open, then closes the connection."""
+
+    def initialize(self, messages, **kwargs):
+        super().initialize(**kwargs)
+        self.messages = messages
+
+    async def open(self):
+        for message in self.messages:
+            await self.write_message(message)
+        self.close()
+
+
+class WebSocketClientCallbackTest(WebSocketBaseTestCase):
+    def get_app(self):
+        return Application(
+            [
+                (
+                    "/send_two_and_close",
+                    SendAndCloseHandler,
+                    dict(messages=["msg1", "msg2"]),
+                ),
+                (
+                    "/send_many_and_close",
+                    SendAndCloseHandler,
+                    dict(messages=["msg%d" % i for i in range(10)]),
+                ),
+            ]
+        )
+
+    @gen_test
+    async def test_on_message_callback_backpressure(self):
+        gate = asyncio.Event()
+        disconnected = asyncio.Event()
+        delivered = []
+        concurrency = 0
+        peak_concurrency = 0
+
+        async def on_message(message):
+            nonlocal concurrency, peak_concurrency
+            delivered.append(message)
+            if message is None:
+                disconnected.set()
+                return
+            concurrency += 1
+            peak_concurrency = max(peak_concurrency, concurrency)
+            try:
+                if message == "msg1":
+                    # Hold the first message; nothing else may be delivered
+                    # until this callback completes.
+                    await gate.wait()
+            finally:
+                concurrency -= 1
+
+        tasks_before = asyncio.all_tasks()
+        yield self.ws_connect("/send_two_and_close", on_message_callback=on_message)
+        # The server sends both messages back-to-back and then closes, but
+        # the second message must wait for the first callback to complete.
+        yield gen.sleep(0.1)
+        self.assertEqual(delivered, ["msg1"])
+        gate.set()
+        yield asyncio.wait_for(disconnected.wait(), timeout=5)
+        # Messages are delivered in wire order, one at a time, and the
+        # None disconnect notification is delivered exactly once.
+        self.assertEqual(delivered, ["msg1", "msg2", None])
+        self.assertEqual(peak_concurrency, 1)
+        # The callback machinery does not leak tasks.
+        yield gen.sleep(0.1)
+        leaked = [t for t in asyncio.all_tasks() - tasks_before if not t.done()]
+        self.assertEqual(leaked, [])
+
+    @gen_test
+    async def test_on_message_callback_ordering(self):
+        delivered = []
+        disconnected = asyncio.Event()
+
+        async def on_message(message):
+            if message is None:
+                disconnected.set()
+            else:
+                # Yield to the event loop between messages; delivery must
+                # still follow the wire order.
+                await asyncio.sleep(0)
+                delivered.append(message)
+
+        yield self.ws_connect("/send_many_and_close", on_message_callback=on_message)
+        yield asyncio.wait_for(disconnected.wait(), timeout=5)
+        self.assertEqual(delivered, ["msg%d" % i for i in range(10)])
+
+    @gen_test
+    async def test_on_message_callback_sync(self):
+        # Plain synchronous callbacks (returning None) keep working.
+        delivered = []
+        disconnected = asyncio.Event()
+
+        def on_message(message):
+            if message is None:
+                disconnected.set()
+            else:
+                delivered.append(message)
+
+        yield self.ws_connect("/send_two_and_close", on_message_callback=on_message)
+        yield asyncio.wait_for(disconnected.wait(), timeout=5)
+        self.assertEqual(delivered, ["msg1", "msg2"])
+
+    @gen_test
+    async def test_on_message_callback_async_error(self):
+        delivered = []
+        disconnected = asyncio.Event()
+
+        async def on_message(message):
+            if message is None:
+                delivered.append(None)
+                disconnected.set()
+                return
+            delivered.append(message)
+            raise Exception("boom")
+
+        with ExpectLog(app_log, "Uncaught exception"):
+            yield self.ws_connect("/send_two_and_close", on_message_callback=on_message)
+            yield asyncio.wait_for(disconnected.wait(), timeout=5)
+        # The failing callback aborts the connection: the second message is
+        # never delivered and the disconnect notification arrives exactly once.
+        self.assertEqual(delivered, ["msg1", None])
+
+
 class PermissiveOriginHandler(EchoHandler):
     def check_origin(self, origin):
         return True

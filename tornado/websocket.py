@@ -1487,7 +1487,9 @@ class WebSocketClientConnection(simple_httpclient._HTTPConnection):
     def __init__(
         self,
         request: httpclient.HTTPRequest,
-        on_message_callback: Callable[[None | str | bytes], None] | None = None,
+        on_message_callback: (
+            Callable[[None | str | bytes], Awaitable[None] | None] | None
+        ) = None,
         compression_options: dict[str, Any] | None = None,
         ping_interval: float | None = None,
         ping_timeout: float | None = None,
@@ -1499,6 +1501,7 @@ class WebSocketClientConnection(simple_httpclient._HTTPConnection):
         self.read_queue: Queue[None | str | bytes] = Queue(1)
         self.key = base64.b64encode(os.urandom(16))
         self._on_message_callback = on_message_callback
+        self._disconnect_notified = False
         self.close_code: int | None = None
         self.close_reason: str | None = None
         self.params = _WebSocketParams(
@@ -1574,9 +1577,34 @@ class WebSocketClientConnection(simple_httpclient._HTTPConnection):
     def on_connection_close(self) -> None:
         if not self.connect_future.done():
             self.connect_future.set_exception(StreamClosedError())
-        self._on_message(None)
+        self._notify_disconnected()
         self.tcp_client.close()
         super().on_connection_close()
+
+    def _notify_disconnected(self) -> None:
+        # Deliver the None disconnect notification at most once, and only
+        # after any earlier message callback has completed (the receive
+        # loop awaits each message before reaching its finally block).
+        if self._disconnect_notified:
+            return
+        self._disconnect_notified = True
+        result = self._on_message(None)
+        if result is not None and self._on_message_callback is not None:
+            # In callback mode the connection is already closed, so the
+            # receive loop cannot await this final notification. Run its
+            # awaitable to completion (at most one per connection) so
+            # async callbacks get deterministic cleanup instead of an
+            # unawaited coroutine. Queue mode keeps its existing
+            # fire-and-forget read_queue.put and spawns no task here.
+            future = gen.convert_yielded(result)
+
+            def on_done(f: "Future[Any]") -> None:
+                try:
+                    f.result()
+                except (Exception, asyncio.CancelledError):
+                    self.log_exception(*sys.exc_info())
+
+            future_add_done_callback(future, on_done)
 
     def on_ws_connection_close(
         self, close_code: int | None = None, close_reason: str | None = None
@@ -1664,8 +1692,15 @@ class WebSocketClientConnection(simple_httpclient._HTTPConnection):
         return self._on_message(message)
 
     def _on_message(self, message: None | str | bytes) -> Awaitable[None] | None:
-        if self._on_message_callback:
-            self._on_message_callback(message)
+        if self._on_message_callback is not None:
+            # If the callback returns an awaitable, pass it back so the
+            # receive loop awaits it before reading the next frame. This
+            # serializes message delivery and applies backpressure to the
+            # socket instead of spawning unbounded tasks. Synchronous
+            # callbacks return None and behave exactly as before.
+            callback_result = self._on_message_callback(message)
+            if callback_result is not None:
+                return callback_result
             return None
         else:
             return self.read_queue.put(message)
@@ -1722,7 +1757,9 @@ def websocket_connect(
     url: str | httpclient.HTTPRequest,
     callback: Callable[["Future[WebSocketClientConnection]"], None] | None = None,
     connect_timeout: float | None = None,
-    on_message_callback: Callable[[None | str | bytes], None] | None = None,
+    on_message_callback: (
+        Callable[[None | str | bytes], Awaitable[None] | None] | None
+    ) = None,
     compression_options: dict[str, Any] | None = None,
     ping_interval: float | None = None,
     ping_timeout: float | None = None,
@@ -1750,7 +1787,21 @@ def websocket_connect(
 
     In the callback style, pass an ``on_message_callback`` to
     ``websocket_connect``. In both styles, a message of ``None``
-    indicates that the connection has been closed.
+    indicates that the connection has been closed. The ``None``
+    notification is delivered at most once.
+
+    ``on_message_callback`` may be a regular function or return an
+    awaitable (for example, an ``async def`` coroutine function). When
+    it returns an awaitable, the connection waits for it to complete
+    before delivering the next message, so messages are processed one
+    at a time in the order they were received and a slow callback
+    applies backpressure to the socket instead of buffering messages
+    in memory. Note that while an awaitable callback is running,
+    incoming control frames (ping, pong, close) are likewise not
+    processed until it completes, so a callback that blocks longer
+    than ``ping_timeout`` may cause the connection to be closed.
+    Exceptions raised by the callback (including cancellation of the
+    awaitable) are logged and close the connection.
 
     ``subprotocols`` may be a list of strings specifying proposed
     subprotocols. The selected protocol may be found on the
@@ -1775,6 +1826,12 @@ def websocket_connect(
 
     .. versionchanged:: 6.3
        Added the ``resolver`` argument.
+
+    .. versionchanged:: 6.7
+       ``on_message_callback`` may now return an awaitable; the connection
+       awaits it before delivering the next message, providing backpressure
+       and serialized delivery. The ``None`` disconnect notification is now
+       guaranteed to be delivered at most once.
 
     .. deprecated:: 6.5
        The ``callback`` argument is deprecated and will be removed in Tornado 7.0.
